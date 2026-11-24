@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  jwt-proxy on a single EC2 instance (Amazon Linux 2023 + Docker Compose).
+  No inbound network access by default: reach the proxy through SSM Session
+  Manager port forwarding. Set AllowedCidr to open the HTTP port to one CIDR.
+
+Parameters:
+  # Source of the code: either a public git URL, or a tarball in a private S3
+  # bucket of this account (deploy.sh picks S3 when the checkout has no remote).
+  RepoUrl:
+    Type: String
+    Default: ""
+    Description: Public git URL of this repository (cloned on first boot). Empty when deploying from S3.
+    AllowedPattern: "^$|^https://.+"
+  GitRef:
+    Type: String
+    Default: main
+    Description: Branch, tag or commit to deploy (git mode only).
+  SourceBucket:
+    Type: String
+    Default: ""
+    Description: Private bucket holding a tar.gz of the repository. Empty in git mode.
+  SourceKey:
+    Type: String
+    Default: ""
+    Description: Object key of the tarball; must start with "<stack name>/" (the instance may read only that prefix).
+  JwtSecretHex:
+    Type: String
+    NoEcho: true
+    Description: HS512 signing secret, hex encoded (64+ bytes).
+    AllowedPattern: "^[0-9a-fA-F]{128,}$"
+    ConstraintDescription: hex string of at least 128 characters
+  UpstreamUrl:
+    Type: String
+    Default: https://postman-echo.com
+  HttpPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1024
+    MaxValue: 65535
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
+    Description: Graviton (arm64) instance size; t4g.micro is enough for the demo.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Resolved automatically to the latest Amazon Linux 2023 arm64 AMI.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Public subnet. In "public" mode the instance lives here with a public IP
+      (outbound only). In "private-nat" mode it hosts the NAT gateway.
+  NetworkMode:
+    Type: String
+    Default: public
+    AllowedValues: [public, private-nat]
+    Description: >-
+      public: instance in SubnetId with a public IP for outbound traffic.
+      private-nat: instance in a new private subnet, outbound through a NAT
+      gateway (required when VPC Block Public Access is on; ~0.045 USD/h extra).
+  AvailabilityZone:
+    Type: String
+    Default: ""
+    Description: AZ of SubnetId (private-nat mode; the private subnet is created in the same AZ).
+  PrivateSubnetCidr:
+    Type: String
+    Default: 172.31.250.0/24
+    Description: CIDR for the private subnet (private-nat mode); must be free within the VPC.
+    AllowedPattern: "^((25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1?\\d?\\d)/(1[6-9]|2[0-8])$"
+  AllowedCidr:
+    Type: String
+    Default: ""
+    Description: >-
+      Leave empty (recommended) for SSM-only access. Otherwise one IPv4 CIDR
+      between /24 and /32 that may reach HttpPort directly, e.g. 203.0.113.7/32.
+    AllowedPattern: "^$|^((25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1?\\d?\\d)/(2[4-9]|3[0-2])$"
+    ConstraintDescription: empty, or an IPv4 CIDR with a prefix length between /24 and /32
+
+Conditions:
+  HasAllowedCidr: !Not [!Equals [!Ref AllowedCidr, ""]]
+  UseS3Source: !Not [!Equals [!Ref SourceBucket, ""]]
+  UseNat: !Equals [!Ref NetworkMode, private-nat]
+
+Rules:
+  ExactlyOneSource:
+    Assertions:
+      - Assert: !Or
+          - !And [!Not [!Equals [!Ref RepoUrl, ""]], !Equals [!Ref SourceBucket, ""]]
+          - !And [!Equals [!Ref RepoUrl, ""], !Not [!Equals [!Ref SourceBucket, ""]], !Not [!Equals [!Ref SourceKey, ""]]]
+        AssertDescription: Set either RepoUrl, or SourceBucket and SourceKey, not both.
+  PrivateNatNeedsAz:
+    RuleCondition: !Equals [!Ref NetworkMode, private-nat]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AvailabilityZone, ""]]
+        AssertDescription: private-nat mode needs AvailabilityZone (the AZ of SubnetId).
+      - Assert: !Equals [!Ref AllowedCidr, ""]
+        AssertDescription: AllowedCidr only applies in public mode (a private instance has no public IP).
+
+Resources:
+  # ---- private-nat mode only: private subnet whose default route is a NAT gateway
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: UseNat
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private" }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNat
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-nat" }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNat
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref SubnetId
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-nat" }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: UseNat
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private" }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: UseNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseNat
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+  # ---- end private-nat mode
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets SSM manage the jwt-proxy instance (and read its source tarball in S3 mode); nothing else.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies: !If
+        - UseS3Source
+        - - PolicyName: read-source-tarball
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${SourceBucket}/${AWS::StackName}/*
+        - !Ref AWS::NoValue
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: jwt-proxy - no inbound unless AllowedCidr is set; outbound HTTP/HTTPS only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "outbound HTTPS: SSM, GitHub, Docker Hub, PyPI, upstream"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "outbound HTTP: package mirrors"
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-sg" }
+
+  # Only created when AllowedCidr is given: a single source CIDR, never 0.0.0.0/0.
+  HttpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAllowedCidr
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref HttpPort
+      ToPort: !Ref HttpPort
+      CidrIp: !Ref AllowedCidr
+      Description: jwt-proxy HTTP from the allowed CIDR
+
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          # public mode: public IP for outbound traffic only (the security group blocks inbound)
+          # private-nat mode: no public IP at all, outbound through the NAT gateway
+          AssociatePublicIpAddress: !If [UseNat, false, true]
+          SubnetId: !If [UseNat, !Ref PrivateSubnet, !Ref SubnetId]
+          GroupSet: [!Ref SecurityGroup]
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required  # IMDSv2 only
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Ref AWS::StackName }
+        # DependsOn cannot be conditional, so this tag creates the implicit
+        # dependency instead: in private-nat mode the instance is only launched
+        # once the NAT route and the subnet association exist, otherwise the
+        # first-boot script would start without internet access.
+        - Key: jwt-proxy:egress
+          Value: !If
+            - UseNat
+            - !Join [" ", [!Ref PrivateDefaultRoute, !Ref PrivateRouteTableAssociation]]
+            - internet-gateway
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              signal() { /opt/aws/bin/cfn-signal -e "$1" --stack "${AWS::StackName}" --resource Instance --region "${AWS::Region}" || true; }
+              trap 'signal 1' ERR
+
+              dnf install -y docker git aws-cfn-bootstrap
+              systemctl enable --now docker
+
+              # Compose and Buildx CLI plugins (AL2023 ships the engine only; Compose needs Buildx to build)
+              install -d /usr/local/lib/docker/cli-plugins
+              curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
+                   -o /usr/local/lib/docker/cli-plugins/docker-compose
+              case "$(uname -m)" in aarch64) barch=arm64 ;; x86_64) barch=amd64 ;; *) barch="$(uname -m)" ;; esac
+              btag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/docker/buildx/releases/latest | sed 's#.*/tag/##')"
+              curl -fsSL "https://github.com/docker/buildx/releases/download/$btag/buildx-$btag.linux-$barch" \
+                   -o /usr/local/lib/docker/cli-plugins/docker-buildx
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-buildx
+              docker compose version && docker buildx version
+
+              if [ -n "${SourceBucket}" ]; then
+                aws s3 cp "s3://${SourceBucket}/${SourceKey}" /tmp/jwt-proxy.tgz --region "${AWS::Region}"
+                mkdir -p /opt/jwt-proxy
+                tar -xzf /tmp/jwt-proxy.tgz -C /opt/jwt-proxy
+                rm -f /tmp/jwt-proxy.tgz
+              else
+                git clone "${RepoUrl}" /opt/jwt-proxy
+                git -C /opt/jwt-proxy checkout --quiet "${GitRef}"
+              fi
+              cd /opt/jwt-proxy
+
+              # .env is root-only and kept out of the xtrace log
+              set +x
+              umask 077
+              cat > .env <<EOF
+              JWT_SECRET_HEX=${JwtSecretHex}
+              UPSTREAM_URL=${UpstreamUrl}
+              HTTP_PORT=${HttpPort}
+              HTTP_BIND=${HttpBind}
+              EOF
+              set -x
+              docker compose up -d --build proxy
+
+              ok=1
+              for i in $(seq 1 30); do
+                if curl -fsS "http://127.0.0.1:${HttpPort}/status"; then ok=0; break; fi
+                sleep 2
+              done
+              signal "$ok"
+            - HttpBind: !If [HasAllowedCidr, "0.0.0.0", "127.0.0.1"]
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  NetworkMode:
+    Value: !Ref NetworkMode
+  PublicIp:
+    Condition: HasAllowedCidr
+    Description: Reachable on HttpPort from AllowedCidr only.
+    Value: !GetAtt Instance.PublicIp
+  PortForwardCommand:
+    Description: Reach the proxy from your machine as http://localhost:8080 (needs the Session Manager plugin).
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${Instance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["${HttpPort}"],"localPortNumber":["8080"]}'
+  ShellCommand:
+    Description: Interactive shell on the instance (logs in /var/log/cloud-init-output.log).
+    Value: !Sub aws ssm start-session --region ${AWS::Region} --target ${Instance}
+  DirectUrl:
+    Condition: HasAllowedCidr
+    Value: !Sub http://${Instance.PublicIp}:${HttpPort}/status

@@ -1,0 +1,40 @@
+# Compose Specification (no top-level `version` field). Docker Engine 27+/28+.
+#
+# Variables are read from the shell first and from ./.env second
+# (`make run` creates .env from .env.example on first use).
+
+services:
+  proxy:
+    build:
+      context: .
+      target: runtime
+    image: jwt-proxy:latest
+    environment:
+      JWT_SECRET_HEX: ${JWT_SECRET_HEX:?missing - copy .env.example to .env}
+      UPSTREAM_URL: ${UPSTREAM_URL:-https://postman-echo.com}
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-10}
+      DEFAULT_USER: ${DEFAULT_USER:-anonymous}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      # HTTP_PORT selects the host port. The host side binds to loopback by
+      # default, so the proxy is reachable from this machine only; set
+      # HTTP_BIND=0.0.0.0 to deliberately expose it on every interface.
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
+    restart: unless-stopped
+    # Hardening: nothing here needs root, write access or extra capabilities.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # `make test` -> docker compose --profile test run --rm --build tests
+  tests:
+    profiles:
+      - test
+    build:
+      context: .
+      target: test
+    image: jwt-proxy:test
